@@ -5,7 +5,6 @@ import functools
 import math
 from dataclasses import dataclass
 from typing import Self
-
 import attrs
 import distrax
 import equinox as eqx
@@ -17,7 +16,9 @@ import mujoco_scenes
 import mujoco_scenes.mjcf
 import optax
 import xax
+from ksim.noise import AdditiveGaussianNoise
 from jaxtyping import Array, PRNGKeyArray
+from ksim.task.rl import InitParams as RLInitParams
 
 # These are in the order of the neural network outputs.
 ZEROS: list[tuple[str, float]] = [
@@ -153,18 +154,27 @@ class StraightLegPenalty(JointPositionPenalty):
         )
 
 
+@attrs.define(frozen=True, kw_only=True)
+class BaseVerticalVelocityPenalty(ksim.Reward):
+    """Penalty on the base vertical velocity to discourage hopping."""
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        base_lin_vel = trajectory.obs["base_linear_velocity_observation"][..., 2]
+        return -jnp.abs(base_lin_vel)
+
+
 class Actor(eqx.Module):
     """Actor for the walking task."""
 
     input_proj: eqx.nn.Linear
     rnns: tuple[eqx.nn.GRUCell, ...]
     output_proj: eqx.nn.Linear
-    num_inputs: int = eqx.static_field()
-    num_outputs: int = eqx.static_field()
-    num_mixtures: int = eqx.static_field()
-    min_std: float = eqx.static_field()
-    max_std: float = eqx.static_field()
-    var_scale: float = eqx.static_field()
+    num_inputs: int = eqx.field(static=True)
+    num_outputs: int = eqx.field(static=True)
+    num_mixtures: int = eqx.field(static=True)
+    min_std: float = eqx.field(static=True)
+    max_std: float = eqx.field(static=True)
+    var_scale: float = eqx.field(static=True)
 
     def __init__(
         self,
@@ -235,7 +245,11 @@ class Actor(eqx.Module):
         # Apply bias to the means.
         mean_nm = mean_nm + jnp.array([v for _, v in ZEROS])[:, None]
 
-        dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
+        # 用 Distrax 组装成"每关节的高斯混合"
+        components = distrax.Normal(loc=mean_nm, scale=std_nm)
+        mixture = distrax.Categorical(logits=logits_nm)
+        per_joint = distrax.MixtureSameFamily(mixture_distribution=mixture, components_distribution=components)
+        dist_n = distrax.Independent(per_joint, reinterpreted_batch_ndims=0)
 
         return dist_n, jnp.stack(out_carries, axis=0)
 
@@ -246,7 +260,7 @@ class Critic(eqx.Module):
     input_proj: eqx.nn.Linear
     rnns: tuple[eqx.nn.GRUCell, ...]
     output_proj: eqx.nn.Linear
-    num_inputs: int = eqx.static_field()
+    num_inputs: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -369,105 +383,137 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             metadata=metadata,
         )
 
-    def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
-        return [
-            ksim.StaticFrictionRandomizer(),
-            ksim.ArmatureRandomizer(),
-            ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.95, scale_upper=1.05),
-            ksim.JointDampingRandomizer(),
-            ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-2), scale_upper=math.radians(2)),
-        ]
+    def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.PhysicsRandomizer]:
+        return {
+            "static_friction": ksim.StaticFrictionRandomizer(),
+            "armature": ksim.ArmatureRandomizer(),
+            "body_mass_scale": ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.95, scale_upper=1.05),
+            "joint_damping": ksim.JointDampingRandomizer(),
+            "joint_zero": ksim.JointZeroPositionRandomizer(
+                scale_lower=math.radians(-2),
+                scale_upper=math.radians(2),
+            ),
+        }
 
-    def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
-        return [
-            ksim.PushEvent(
-                x_force=1.0,
-                y_force=1.0,
-                z_force=0.3,
-                force_range=(0.5, 1.0),
-                x_angular_force=0.0,
-                y_angular_force=0.0,
-                z_angular_force=0.0,
+    def get_events(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Event]:
+        return {
+            "linear_push": ksim.LinearPushEvent(
+                linvel=1.0,
+                vel_range=(0.5, 1.0),
                 interval_range=(0.5, 4.0),
             ),
-        ]
+        }
 
-    def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
-        return [
+    def get_resets(self, physics_model: ksim.PhysicsModel) -> tuple[ksim.Reset, ...]:
+        resets = [
             ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v in ZEROS}, scale=0.1),
             ksim.RandomJointVelocityReset(),
         ]
+        return tuple(resets)
 
-    def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
-        return [
-            ksim.TimestepObservation(),
-            ksim.JointPositionObservation(noise=math.radians(2)),
-            ksim.JointVelocityObservation(noise=math.radians(10)),
-            ksim.ActuatorForceObservation(),
-            ksim.CenterOfMassInertiaObservation(),
-            ksim.CenterOfMassVelocityObservation(),
-            ksim.BasePositionObservation(),
-            ksim.BaseOrientationObservation(),
-            ksim.BaseLinearVelocityObservation(),
-            ksim.BaseAngularVelocityObservation(),
-            ksim.BaseLinearAccelerationObservation(),
-            ksim.BaseAngularAccelerationObservation(),
-            ksim.ActuatorAccelerationObservation(),
-            ksim.ProjectedGravityObservation.create(
+    def get_observations(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Observation]:
+        # 定义噪声对象，便于阅读和维护
+        joint_pos_noise = AdditiveGaussianNoise(std=math.radians(2))
+        joint_vel_noise = AdditiveGaussianNoise(std=math.radians(10))
+        proj_grav_noise = AdditiveGaussianNoise(std=math.radians(1))
+        imu_acc_noise = AdditiveGaussianNoise(std=1.0)
+        imu_gyro_noise = AdditiveGaussianNoise(std=math.radians(10))
+        
+        return {
+            "timestep_observation": ksim.TimestepObservation(),
+            "joint_position_observation": ksim.JointPositionObservation(noise=joint_pos_noise),
+            "joint_velocity_observation": ksim.JointVelocityObservation(noise=joint_vel_noise),
+            "actuator_force_observation": ksim.ActuatorForceObservation(),
+            "center_of_mass_inertia_observation": ksim.CenterOfMassInertiaObservation(),
+            "center_of_mass_velocity_observation": ksim.CenterOfMassVelocityObservation(),
+            "base_position_observation": ksim.BasePositionObservation(),
+            "base_orientation_observation": ksim.BaseOrientationObservation(),
+            "base_linear_velocity_observation": ksim.BaseLinearVelocityObservation(),
+            "base_angular_velocity_observation": ksim.BaseAngularVelocityObservation(),
+            "base_linear_acceleration_observation": ksim.BaseLinearAccelerationObservation(),
+            "base_angular_acceleration_observation": ksim.BaseAngularAccelerationObservation(),
+            "actuator_acceleration_observation": ksim.ActuatorAccelerationObservation(),
+            "projected_gravity_observation": ksim.ProjectedGravityObservation.create(
                 physics_model=physics_model,
                 framequat_name="imu_site_quat",
-                lag_range=(0.0, 0.1),
-                noise=math.radians(1),
+                min_lag=0.0,
+                max_lag=0.1,
+                noise=proj_grav_noise,
             ),
-            ksim.SensorObservation.create(
+            "sensor_observation_imu_acc": ksim.SensorObservation.create(
                 physics_model=physics_model,
                 sensor_name="imu_acc",
-                noise=1.0,
+                noise=imu_acc_noise,
             ),
-            ksim.SensorObservation.create(
+            "sensor_observation_imu_gyro": ksim.SensorObservation.create(
                 physics_model=physics_model,
                 sensor_name="imu_gyro",
-                noise=math.radians(10),
+                noise=imu_gyro_noise,
             ),
-        ]
+        }
 
-    def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        return []
+    def get_commands(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Command]:
+        return {
+            "linear_velocity_command": ksim.LinearVelocityCommand(
+                min_vel=0.0,
+                max_vel=0.8,
+                max_yaw=0.3,
+                zero_prob=0.1,
+                backward_prob=0.0,
+                switch_prob=0.02,
+                vis_height=0.6,
+                vis_scale=0.05,
+            ),
+            "angular_velocity_command": ksim.AngularVelocityCommand(
+                min_vel=0.0,
+                max_vel=0.3,
+                zero_prob=0.5,
+                switch_prob=0.02,
+            ),
+        }
 
-    def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
-        return [
+    def get_rewards(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Reward]:
+        return {
             # Standard rewards.
-            ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
-            ksim.NaiveForwardOrientationReward(scale=1.0),
-            ksim.StayAliveReward(scale=1.0),
-            ksim.UprightReward(scale=0.5),
+            "lin_vel": ksim.LinearVelocityReward(
+                scale=3.0,
+                cmd="linear_velocity_command",
+            ),
+            "off_axis": ksim.OffAxisVelocityReward(scale=1.0),
+            "stay_alive": ksim.StayAliveReward(scale=1.0),
+            "upright": ksim.UprightReward(scale=0.5),
             # Avoid movement penalties.
-            ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.1),
-            ksim.LinearVelocityPenalty(index=("z"), scale=-0.1),
+            "ang_vel": ksim.AngularVelocityReward(
+                scale=1.0,
+                cmd="angular_velocity_command",
+                angvel_length_scale=0.2,
+            ),
+            "lin_vel_penalty": BaseVerticalVelocityPenalty(scale=-0.1),
             # Normalization penalties.
-            ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            "avoid_limits": ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
+            "joint_acc": ksim.JointAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            "joint_jerk": ksim.JointJerkPenalty(scale=-0.01, scale_by_curriculum=True),
+            "link_acc": ksim.LinkAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
+            "link_jerk": ksim.LinkJerkPenalty(scale=-0.01, scale_by_curriculum=True),
+            "action_acc": ksim.ActionAccelerationPenalty(scale=-0.01, scale_by_curriculum=True),
             # Bespoke rewards.
-            BentArmPenalty.create_penalty(physics_model, scale=-0.1),
-            StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
-        ]
+            "bent_arm": BentArmPenalty.create_penalty(physics_model, scale=-0.1),
+            "straight_leg": StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
+        }
 
-    def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
-        return [
-            ksim.BadZTermination(unhealthy_z_lower=0.6, unhealthy_z_upper=1.2),
-            ksim.FarFromOriginTermination(max_dist=10.0),
-        ]
+    def get_terminations(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Termination]:
+        return {
+            "bad_z": ksim.BadZTermination(min_z=0.6, max_z=1.2),
+            "far_from_origin": ksim.FarFromOriginTermination(max_dist=10.0),
+        }
 
     def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
         return ksim.DistanceFromOriginCurriculum(
             min_level_steps=5,
         )
 
-    def get_model(self, key: PRNGKeyArray) -> Model:
+    def get_model(self, params: RLInitParams) -> Model:
+        key = params.key
         return Model(
             key,
             num_actor_inputs=51 if self.config.use_acc_gyro else 45,
@@ -586,7 +632,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         next_carry = jax.tree.map(
             lambda x, y: jnp.where(transition.done, x, y),
-            self.get_initial_model_carry(rng),
+            self.get_initial_model_carry(model, rng),
             (next_actor_carry, next_critic_carry),
         )
 
@@ -608,7 +654,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         )
         return ppo_variables, next_model_carry
 
-    def get_initial_model_carry(self, rng: PRNGKeyArray) -> tuple[Array, Array]:
+    def get_initial_model_carry(self, model: Model, rng: PRNGKeyArray) -> tuple[Array, Array]:
         return (
             jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
             jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
@@ -640,12 +686,10 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=2048,
-            batch_size=256,
+            num_envs=64,
+            batch_size=32,
             num_passes=4,
-            epochs_per_log_step=1,
             rollout_length_seconds=8.0,
-            global_grad_clip=2.0,
             # Simulation parameters.
             dt=0.002,
             ctrl_dt=0.02,
@@ -657,5 +701,6 @@ if __name__ == "__main__":
             render_track_body_id=0,
             # Checkpointing parameters.
             save_every_n_seconds=60,
+            disable_multiprocessing=True,
         ),
     )
